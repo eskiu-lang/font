@@ -1,0 +1,241 @@
+// text.esk: laying out and drawing text, and glyph atlases for GPU text.
+//
+//     List<FontPlaced> line;
+//     f.layout("Hello, Eskiu", 24.0, &line);   // pen positions with kerning
+//     f.draw("Hello", 24.0, rgba, width, height, 10, 40, 0xFFFFFFFF);
+//
+//     FontAtlas atlas = f.atlas(32.0, " !\"#...~")?;  // one 8-bit texture
+//     FontAtlasGlyph* g = atlas.find('A');            // its rectangle and metrics
+//
+// Text is UTF-8; '\n' starts a new line. Positions are in pixels from the
+// first line's baseline, y down.
+
+import <mem>;
+import <list>;
+import <result>;
+import <libc>;
+import <font/ttf>;
+import <font/raster>;
+
+struct FontPlaced {
+    uint32 cp;
+    int glyph;
+    float x;
+    float y;
+}
+
+struct FontAtlasGlyph {
+    uint32 cp;
+    int glyph;
+    int x;
+    int y;
+    int width;
+    int height;
+    int left;
+    int top;
+    float advance;
+}
+
+// An 8-bit coverage texture of width x height holding the glyphs.
+struct FontAtlas {
+    int width;
+    int height;
+    *uint8 pixels;
+    float size;
+    float line_height;
+    float ascent;
+    List<FontAtlasGlyph> glyphs;
+}
+
+// Decodes the UTF-8 character at s[*i] and moves *i past it; a malformed
+// sequence gives U+FFFD and moves one byte.
+uint32 font_utf8_next(string s, *int64 i) {
+    uint32 b0 = (uint32)(uint8)s[*i];
+    if (b0 < 0x80) {
+        *i = *i + 1;
+        return b0;
+    }
+    int n = 0;
+    uint32 cp = 0;
+    if ((b0 & 0xE0) == 0xC0) {
+        n = 1;
+        cp = b0 & 0x1F;
+    } else if ((b0 & 0xF0) == 0xE0) {
+        n = 2;
+        cp = b0 & 0x0F;
+    } else if ((b0 & 0xF8) == 0xF0) {
+        n = 3;
+        cp = b0 & 0x07;
+    } else {
+        *i = *i + 1;
+        return 0xFFFD;
+    }
+    for (k in 1..n + 1) {
+        uint32 b = (uint32)(uint8)s[*i + (int64)k];
+        if ((b & 0xC0) != 0x80) {
+            *i = *i + 1;
+            return 0xFFFD;
+        }
+        cp = (cp << 6) | (b & 0x3F);
+    }
+    *i = *i + (int64)n + 1;
+    return cp;
+}
+
+// The distance from one baseline to the next at px pixels.
+float Font_line_height(*Font self, float px) {
+    return (float)(self.ascent - self.descent + self.line_gap) * Font_scale(self, px);
+}
+
+// Appends each character of text with its pen position.
+void Font_layout(*Font self, string text, float px, List<FontPlaced>* out) {
+    float scale = Font_scale(self, px);
+    float x = 0.0;
+    float y = 0.0;
+    int prev = -1;
+    int64 i = 0;
+    while (text[i] != 0) {
+        uint32 cp = font_utf8_next(text, &i);
+        if (cp == 10) {
+            x = 0.0;
+            y = y + Font_line_height(self, px);
+            prev = -1;
+            continue;
+        }
+        int g = Font_glyph(self, cp);
+        if (prev >= 0) x = x + (float)Font_kerning(self, prev, g) * scale;
+        List_push(out, FontPlaced{cp, g, x, y});
+        x = x + (float)Font_advance(self, g) * scale;
+        prev = g;
+    }
+}
+
+// The width of the widest line of text, and its height (lines times the line
+// height), at px pixels.
+void Font_measure(*Font self, string text, float px, *float width, *float height) {
+    List<FontPlaced> placed;
+    defer List_free(&placed);
+    Font_layout(self, text, px, &placed);
+    float scale = Font_scale(self, px);
+    float w = 0.0;
+    float lines = 1.0;
+    float last_y = 0.0;
+    for (i in 0..placed.size) {
+        FontPlaced* p = &placed.data[i];
+        float right = p.x + (float)Font_advance(self, p.glyph) * scale;
+        if (right > w) w = right;
+        if (p.y > last_y) last_y = p.y;
+    }
+    int64 k = 0;
+    while (text[k] != 0) {
+        if (text[k] == '\n') lines = lines + 1.0;
+        k++;
+    }
+    *width = w;
+    *height = lines * Font_line_height(self, px);
+}
+
+// Draws text into an RGBA image (width x height pixels, 4 bytes each) with the
+// first baseline at (x, y), blending color (0xRRGGBBAA) by each pixel's
+// coverage.
+void Font_draw(*Font self, string text, float px, *uint8 rgba, int width, int height, float x, float y, uint32 color) {
+    List<FontPlaced> placed;
+    defer List_free(&placed);
+    Font_layout(self, text, px, &placed);
+    float cr = (float)((color >> 24) & 255);
+    float cg = (float)((color >> 16) & 255);
+    float cb = (float)((color >> 8) & 255);
+    float ca = (float)(color & 255) / 255.0;
+    for (i in 0..placed.size) {
+        FontPlaced* p = &placed.data[i];
+        float pen = x + p.x;
+        float base = floorf(pen);
+        Result<GlyphBitmap, string> r = Font_render_at(self, p.glyph, px, pen - base);
+        if (!r.ok) continue;
+        GlyphBitmap b = r.value;
+        int ox = (int)base + b.left;
+        int oy = (int)floorf(y + p.y + 0.5) + b.top;
+        for (gy in 0..b.height) {
+            int py = oy + gy;
+            if (py < 0 || py >= height) continue;
+            for (gx in 0..b.width) {
+                int qx = ox + gx;
+                if (qx < 0 || qx >= width) continue;
+                float a = (float)b.pixels[gy * b.width + gx] / 255.0 * ca;
+                if (a <= 0.0) continue;
+                *uint8 d = rgba + ((int64)py * width + qx) * 4;
+                d[0] = (uint8)((float)d[0] + (cr - (float)d[0]) * a + 0.5);
+                d[1] = (uint8)((float)d[1] + (cg - (float)d[1]) * a + 0.5);
+                d[2] = (uint8)((float)d[2] + (cb - (float)d[2]) * a + 0.5);
+                float da = (float)d[3] / 255.0;
+                d[3] = (uint8)((da + a * (1.0 - da)) * 255.0 + 0.5);
+            }
+        }
+        b.free();
+    }
+}
+
+// Renders every character of chars (UTF-8) at px pixels into one atlas,
+// packed in rows with a pixel of space around each glyph.
+Result<FontAtlas, string> Font_atlas(*Font self, float px, string chars) {
+    FontAtlas a;
+    a.size = px;
+    a.line_height = Font_line_height(self, px);
+    a.ascent = (float)self.ascent * Font_scale(self, px);
+    List<GlyphBitmap> bitmaps;
+    defer List_free(&bitmaps);
+    float scale = Font_scale(self, px);
+    int64 i = 0;
+    int area = 0;
+    while (chars[i] != 0) {
+        uint32 cp = font_utf8_next(chars, &i);
+        int g = Font_glyph(self, cp);
+        GlyphBitmap b = Font_render(self, g, px)?;
+        FontAtlasGlyph e = FontAtlasGlyph{cp, g, 0, 0, b.width, b.height, b.left, b.top, (float)Font_advance(self, g) * scale};
+        List_push(&a.glyphs, e);
+        List_push(&bitmaps, b);
+        area += (b.width + 2) * (b.height + 2);
+    }
+    int side = 64;
+    while (side * side < area * 2) side = side * 2;
+    a.width = side;
+    int x = 1;
+    int y = 1;
+    int row = 0;
+    for (k in 0..a.glyphs.size) {
+        FontAtlasGlyph* e = &a.glyphs.data[k];
+        if (x + e.width + 1 > side) {
+            x = 1;
+            y = y + row + 1;
+            row = 0;
+        }
+        e.x = x;
+        e.y = y;
+        x = x + e.width + 1;
+        if (e.height > row) row = e.height;
+    }
+    int h = 1;
+    while (h < y + row + 1) h = h * 2;
+    a.height = h;
+    a.pixels = alloc<uint8>(a.width * a.height);
+    for (k in 0..a.glyphs.size) {
+        FontAtlasGlyph* e = &a.glyphs.data[k];
+        GlyphBitmap* b = &bitmaps.data[k];
+        for (gy in 0..b.height) memcpy(a.pixels + (int64)(e.y + gy) * a.width + e.x, b.pixels + (int64)gy * b.width, (int64)b.width);
+        b.free();
+    }
+    return Ok<FontAtlas, string>(a);
+}
+
+FontAtlasGlyph* FontAtlas_find(*FontAtlas self, uint32 cp) {
+    for (i in 0..self.glyphs.size) {
+        if (self.glyphs.data[i].cp == cp) return &self.glyphs.data[i];
+    }
+    return null;
+}
+
+void FontAtlas_free(*FontAtlas self) {
+    if (self.pixels != null) free(self.pixels);
+    self.pixels = null;
+    List_free(&self.glyphs);
+}
