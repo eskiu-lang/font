@@ -1,0 +1,190 @@
+// The font reader and rasterizer against fontTools (tests/data/reference.txt,
+// made by tools/gen_reference.py): glyph indices, metrics, boxes, kerning,
+// the exact outline area, and each glyph's total coverage at 48 px equal to
+// that area. Then layout, atlas, UTF-8 and damaged fonts.
+import <io>;
+import <mem>;
+import <list>;
+import <fs>;
+import <libc>;
+import <font>;
+
+int fails = 0;
+int reported = 0;
+
+void fail(string what, int cp, double got, double want) {
+    fails++;
+    if (reported < 12) printf("FAIL %s U+%04X: %g, want %g\n", what, cp, got, want);
+    reported++;
+}
+
+// The exact area of a quadratic outline (Green's theorem).
+double outline_area(List<FontCurve>* cs) {
+    double a = 0.0;
+    for (i in 0..cs.size) {
+        FontCurve* c = &cs.data[i];
+        double x0 = (double)c.x0;
+        double y0 = (double)c.y0;
+        double cx = (double)c.cx;
+        double cy = (double)c.cy;
+        double x1 = (double)c.x1;
+        double y1 = (double)c.y1;
+        a += ((x0 * cy - cx * y0) + (cx * y1 - x1 * cy)) / 3.0 + (x0 * y1 - x1 * y0) / 6.0;
+    }
+    return fabs(a);
+}
+
+int main() {
+    Result<Font, string> fr = font_load("tests/data/DejaVuSans-Latin1.ttf");
+    if (!fr.ok) {
+        printf("error: %s\n", fr.error);
+        return 1;
+    }
+    Font f = fr.value;
+    int64 n = 0;
+    *char ref = (*char)fs_read_all("tests/data/reference.txt", &n);
+    defer free(ref);
+    *char p = ref;
+    int chars = 0;
+    int pairs = 0;
+    float px = 48.0;
+    float scale = f.scale(px);
+    while (*p != 0) {
+        *char end = p;
+        if (strncmp((string)p, "kern ", 5) == 0) {
+            *char q = p + 5;
+            int a = (int)strtoll((string)q, (*string)&q, 10);
+            int b = (int)strtoll((string)q, (*string)&q, 10);
+            int v = (int)strtoll((string)q, (*string)&q, 10);
+            int got = f.kerning(f.glyph((uint32)a), f.glyph((uint32)b));
+            if (got != v) fail("kerning", a, (double)got, (double)v);
+            pairs++;
+            p = q;
+        } else {
+            int[8] v;
+            for (k in 0..8) v[k] = (int)strtoll((string)p, (*string)&p, 10);
+            double area = strtod((string)p, (*string)&end);
+            p = end;
+            uint32 cp = (uint32)v[0];
+            int g = f.glyph(cp);
+            if (g != v[1]) fail("glyph index", v[0], (double)g, (double)v[1]);
+            if (f.advance(g) != v[2]) fail("advance", v[0], (double)f.advance(g), (double)v[2]);
+            if (f.left_bearing(g) != v[3]) fail("left bearing", v[0], (double)f.left_bearing(g), (double)v[3]);
+            FontBox box = f.box(g);
+            if (box.x0 != v[4] || box.y0 != v[5] || box.x1 != v[6] || box.y1 != v[7]) fail("box", v[0], (double)box.x1, (double)v[6]);
+            List<FontCurve> cs;
+            if (!f.outline(g, &cs)) fail("outline", v[0], 0.0, 1.0);
+            double oa = outline_area(&cs);
+            if (fabs(oa - area) > 0.5 + area * 0.000001) fail("outline area", v[0], oa, area);
+            List_free(&cs);
+            Result<GlyphBitmap, string> br = f.render(g, px);
+            if (!br.ok) fail("render", v[0], 0.0, 1.0);
+            else {
+                GlyphBitmap b = br.value;
+                double cover = 0.0;
+                for (k in 0..b.width * b.height) cover += (double)b.pixels[k] / 255.0;
+                double want = area * (double)scale * (double)scale;
+                // Overlapping contours (a composite's parts) cover less than
+                // their summed area.
+                double tol = 0.6 + want * 0.006;
+                if (cover > want + tol || cover < want - tol - want * 0.015) fail("coverage", v[0], cover, want);
+                b.free();
+            }
+            chars++;
+        }
+        while (*p == '\n' || *p == ' ') p = p + 1;
+    }
+    if (chars != 191 || pairs < 1000) {
+        printf("FAIL reference: %d characters, %d kerning pairs read\n", chars, pairs);
+        fails++;
+    }
+
+    List<FontPlaced> line;
+    f.layout("AV\nToé", 32.0, &line);
+    float av = (float)(f.advance(f.glyph('A')) + f.kerning(f.glyph('A'), f.glyph('V'))) * f.scale(32.0);
+    if (line.size != 5 || fabsf(line.data[1].x - av) > 0.001 || line.data[2].x != 0.0 || line.data[2].y <= 0.0 || line.data[4].cp != 233) {
+        printf("FAIL layout\n");
+        fails++;
+    }
+    List_free(&line);
+    float w = 0.0;
+    float h = 0.0;
+    f.measure("Hi\nthere", 20.0, &w, &h);
+    if (w <= 0.0 || fabsf(h - 2.0 * f.line_height(20.0)) > 0.001) {
+        printf("FAIL measure\n");
+        fails++;
+    }
+    Result<FontAtlas, string> ar = f.atlas(24.0, " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~éñü");
+    if (!ar.ok) {
+        printf("FAIL atlas: %s\n", ar.error);
+        fails++;
+    } else {
+        FontAtlas a = ar.value;
+        FontAtlasGlyph* e = a.find(241);
+        bool inside = e != null && e.x + e.width <= a.width && e.y + e.height <= a.height && a.glyphs.size == 98;
+        for (k in 0..a.glyphs.size) {
+            FontAtlasGlyph* x = &a.glyphs.data[k];
+            for (j in k + 1..a.glyphs.size) {
+                FontAtlasGlyph* y = &a.glyphs.data[j];
+                bool apart = x.x + x.width <= y.x || y.x + y.width <= x.x || x.y + x.height <= y.y || y.y + y.height <= x.y;
+                if (!apart && x.width > 0 && y.width > 0) inside = false;
+            }
+        }
+        if (!inside) {
+            printf("FAIL atlas packing\n");
+            fails++;
+        }
+        a.free();
+    }
+    *uint8 img = alloc<uint8>(200 * 60 * 4);
+    f.draw("Eskiu", 32.0, img, 200, 60, 10.0, 40.0, 0x000000FF);
+    int inked = 0;
+    for (k in 0..200 * 60) {
+        if (img[k * 4 + 3] > 0) inked++;
+    }
+    if (inked < 300) {
+        printf("FAIL draw: %d pixels inked\n", inked);
+        fails++;
+    }
+    free(img);
+    int64 at = 0;
+    string utf = "a\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80\xFF";
+    uint32[5] want = {97, 233, 0x20AC, 0x1F600, 0xFFFD};
+    for (k in 0..5) {
+        uint32 cp = font_utf8_next(utf, &at);
+        if (cp != want[k]) {
+            printf("FAIL utf-8 %d: %x\n", k, cp);
+            fails++;
+        }
+    }
+
+    int64 len = 0;
+    *uint8 file = fs_read_all("tests/data/DejaVuSans-Latin1.ttf", &len);
+    defer free(file);
+    uint32 seed = 11;
+    for (round in 0..300) {
+        *uint8 copy = alloc<uint8>(len);
+        memcpy(copy, file, len);
+        int64 cut = len;
+        if (round < 100) cut = (int64)round * len / 100;
+        else {
+            for (k in 0..6) {
+                seed = seed * 1103515245 + 12345;
+                copy[(int64)(seed >> 8) % len] = (uint8)(seed >> 3);
+            }
+        }
+        Result<Font, string> r = font_parse(copy, (uint64)cut);
+        if (r.ok) {
+            Font g = r.value;
+            for (cp in 32..256) {
+                Result<GlyphBitmap, string> b = g.render(g.glyph((uint32)cp), 16.0);
+                if (b.ok) b.value.free();
+                (void)g.kerning(g.glyph((uint32)cp), g.glyph(65));
+            }
+            g.free();
+        } else free(copy);
+    }
+    f.free();
+    printf("font: %d failures (%d characters, %d kerning pairs)\n", fails, chars, pairs);
+    return fails == 0 ? 0 : 1;
+}
