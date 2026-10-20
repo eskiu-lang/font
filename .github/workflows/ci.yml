@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Eskiu
+        run: |
+          curl -fsSL https://eskiu-lang.org/install.sh | ESKIU_PREFIX=$HOME/.eskiu sh
+          echo "$HOME/.eskiu/bin" >> $GITHUB_PATH
+      - name: Tests
+        run: eskiuc test
+      - name: Example
+        run: eskiuc run examples/render.esk -- "Eskiu" 16
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Eskiu
+        run: brew install eskiu-lang/eskiu/eskiu
+      - name: Tests
+        run: eskiuc test
+      - name: Address sanitizer
+        run: |
+          mkdir -p build
+          eskiuc --asan tests/font.esk -o build/font_asan
+          build/font_asan
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc unzip
+      - name: Install Eskiu
+        run: |
+          curl -fsSL -o eskiu.zip https://github.com/eskiu-lang/eskiu/releases/latest/download/eskiuc-windows-x86_64.zip
+          unzip -q eskiu.zip -d $HOME/eskiu
+      - name: Tests
+        run: |
+          export PATH="$HOME/eskiu/bin:$PATH"
+          CC=gcc eskiuc test
