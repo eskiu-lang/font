@@ -1,0 +1,196 @@
+// raster.esk: glyph outlines to antialiased coverage bitmaps.
+//
+//     GlyphBitmap b = f.render(f.glyph('g'), 32.0)?;
+//     defer b.free();
+//     // b.pixels: b.width * b.height coverage values (0 to 255), top row
+//     // first; b.left and b.top place it from the pen position on the
+//     // baseline (top is negative above the baseline).
+//
+// The coverage is exact area coverage: every outline segment adds the signed
+// area it covers to each pixel of its rows, and a running sum along each row
+// gives the coverage (the method of font-rs). Curves are flattened finely
+// enough that the error stays under a tenth of a pixel.
+
+import <mem>;
+import <list>;
+import <result>;
+import <libc>;
+import <font/ttf>;
+
+struct GlyphBitmap {
+    int width;
+    int height;
+    int left;
+    int top;
+    *uint8 pixels;
+}
+
+void GlyphBitmap_free(*GlyphBitmap self) {
+    if (self.pixels != null) free(self.pixels);
+    self.pixels = null;
+}
+
+// The accumulation buffer of one bitmap, w x h plus slack for the last
+// column.
+struct _Acc {
+    *float a;
+    int w;
+    int h;
+}
+
+void _acc_line(_Acc* r, float x0, float y0, float x1, float y1) {
+    if (y0 == y1) return;
+    float dir = 1.0;
+    if (y0 > y1) {
+        dir = -1.0;
+        float t = x0;
+        x0 = x1;
+        x1 = t;
+        t = y0;
+        y0 = y1;
+        y1 = t;
+    }
+    float dxdy = (x1 - x0) / (y1 - y0);
+    float x = x0;
+    int ystart = (int)floorf(y0);
+    if (ystart < 0) {
+        x = x - y0 * dxdy;
+        ystart = 0;
+        y0 = 0.0;
+    }
+    int yend = (int)ceilf(y1);
+    if (yend > r.h) yend = r.h;
+    for (y in ystart..yend) {
+        float top = (float)y > y0 ? (float)y : y0;
+        float bot = (float)(y + 1) < y1 ? (float)(y + 1) : y1;
+        float dy = bot - top;
+        if (dy <= 0.0) continue;
+        float xnext = x + dxdy * dy;
+        float d = dy * dir;
+        float xa = x < xnext ? x : xnext;
+        float xb = x < xnext ? xnext : x;
+        if (xa < 0.0) xa = 0.0;
+        if (xb < 0.0) xb = 0.0;
+        float xaf = floorf(xa);
+        int xai = (int)xaf;
+        float xbc = ceilf(xb);
+        int xbi = (int)xbc;
+        int row = y * r.w;
+        if (xai > r.w) xai = r.w;
+        if (xbi <= xai + 1) {
+            float xm = 0.5 * (x + xnext) - xaf;
+            if (xm < 0.0) xm = 0.0;
+            if (xm > 1.0) xm = 1.0;
+            r.a[row + xai] += d - d * xm;
+            r.a[row + xai + 1] += d * xm;
+        } else {
+            if (xbi > r.w + 2) xbi = r.w + 2;
+            float s = 1.0 / (xb - xa);
+            float x0f = xa - xaf;
+            float a0 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f);
+            float x1f = xb - xbc + 1.0;
+            float am = 0.5 * s * x1f * x1f;
+            r.a[row + xai] += d * a0;
+            if (xbi == xai + 2) r.a[row + xai + 1] += d * (1.0 - a0 - am);
+            else {
+                float a1 = s * (1.5 - x0f);
+                r.a[row + xai + 1] += d * (a1 - a0);
+                for (xi in xai + 2..xbi - 1) r.a[row + xi] += d * s;
+                float a2 = a1 + (float)(xbi - xai - 3) * s;
+                r.a[row + xbi - 1] += d * (1.0 - a2 - am);
+            }
+            r.a[row + xbi] += d * am;
+        }
+        x = xnext;
+    }
+}
+
+void _acc_quad(_Acc* r, float x0, float y0, float cx, float cy, float x1, float y1) {
+    float ddx = x0 - 2.0 * cx + x1;
+    float ddy = y0 - 2.0 * cy + y1;
+    float dev = ddx * ddx + ddy * ddy;
+    if (dev < 0.01) {
+        _acc_line(r, x0, y0, x1, y1);
+        return;
+    }
+    int n = 1 + (int)floorf(sqrtf(sqrtf(dev * 10.0)));
+    if (n > 64) n = 64;
+    float px = x0;
+    float py = y0;
+    for (i in 1..n + 1) {
+        float t = (float)i / (float)n;
+        float u = 1.0 - t;
+        float qx = u * u * x0 + 2.0 * u * t * cx + t * t * x1;
+        float qy = u * u * y0 + 2.0 * u * t * cy + t * t * y1;
+        _acc_line(r, px, py, qx, qy);
+        px = qx;
+        py = qy;
+    }
+}
+
+// Renders curves (font units, y up) at scale pixels per unit, shifted right
+// by dx pixels (a subpixel pen position from 0 to 1).
+Result<GlyphBitmap, string> font_rasterize(List<FontCurve>* curves, float scale, float dx) {
+    GlyphBitmap b;
+    if (curves.size == 0) return Ok<GlyphBitmap, string>(b);
+    float minx = 1e30;
+    float miny = 1e30;
+    float maxx = -1e30;
+    float maxy = -1e30;
+    for (i in 0..curves.size) {
+        FontCurve* c = &curves.data[i];
+        float[3] xs = {c.x0, c.cx, c.x1};
+        float[3] ys = {c.y0, c.cy, c.y1};
+        for (k in 0..3) {
+            if (xs[k] < minx) minx = xs[k];
+            if (xs[k] > maxx) maxx = xs[k];
+            if (ys[k] < miny) miny = ys[k];
+            if (ys[k] > maxy) maxy = ys[k];
+        }
+    }
+    int x0 = (int)floorf(minx * scale + dx);
+    int x1 = (int)ceilf(maxx * scale + dx);
+    int y0 = (int)floorf(-maxy * scale);
+    int y1 = (int)ceilf(-miny * scale);
+    int w = x1 - x0;
+    int h = y1 - y0;
+    if (w <= 0 || h <= 0) return Ok<GlyphBitmap, string>(b);
+    if (w > 8192 || h > 8192) return Err<GlyphBitmap, string>("font: the glyph is too large to render");
+    _Acc r = _Acc{alloc<float>(w * h + w + 8), w, h};
+    defer free(r.a);
+    for (i in 0..curves.size) {
+        FontCurve* c = &curves.data[i];
+        _acc_quad(&r, c.x0 * scale + dx - (float)x0, -c.y0 * scale - (float)y0, c.cx * scale + dx - (float)x0,
+            -c.cy * scale - (float)y0, c.x1 * scale + dx - (float)x0, -c.y1 * scale - (float)y0);
+    }
+    b.width = w;
+    b.height = h;
+    b.left = x0;
+    b.top = y0;
+    b.pixels = alloc<uint8>(w * h);
+    // One running sum over the whole buffer: a segment that ends at a row's
+    // right edge writes its remainder into the next row's first cell, and
+    // the contributions of a row add up to zero for closed contours.
+    float acc = 0.0;
+    for (i in 0..w * h) {
+        acc += r.a[i];
+        float v = fabsf(acc);
+        if (v > 1.0) v = 1.0;
+        b.pixels[i] = (uint8)(v * 255.0 + 0.5);
+    }
+    return Ok<GlyphBitmap, string>(b);
+}
+
+// Glyph g at a font size of px pixels.
+Result<GlyphBitmap, string> Font_render(*Font self, int g, float px) {
+    return Font_render_at(self, g, px, 0.0);
+}
+
+// Glyph g at px pixels with the pen dx pixels (0 to 1) right of a pixel
+// boundary.
+Result<GlyphBitmap, string> Font_render_at(*Font self, int g, float px, float dx) {
+    List<FontCurve> curves;
+    defer List_free(&curves);
+    if (!Font_outline(self, g, &curves)) return Err<GlyphBitmap, string>("font: malformed glyph data");
+    return font_rasterize(&curves, Font_scale(self, px), dx);
+}
