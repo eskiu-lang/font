@@ -1,0 +1,50 @@
+// Renders a line of text with a TrueType font, to the terminal as shaded
+// characters or to a PGM image.
+//
+//     eskiuc run examples/render.esk -- "Hola, Eskiu"
+//     eskiuc run examples/render.esk -- "Hola" 64 out.pgm
+//     eskiuc run examples/render.esk -- "Hola" 64 out.pgm /path/to/font.ttf
+import <io>;
+import <mem>;
+import <libc>;
+import <font>;
+
+int main(int argc, string* argv) {
+    string text = argc > 1 ? argv[1] : "Eskiu";
+    float px = argc > 2 ? (float)atoi(argv[2]) : 24.0;
+    string path = argc > 4 ? argv[4] : "tests/data/DejaVuSans-Latin1.ttf";
+    Result<Font, string> fr = font_load(path);
+    if (!fr.ok) {
+        printf("%s\n", fr.error);
+        return 1;
+    }
+    Font f = fr.value;
+    defer f.free();
+    float w = 0.0;
+    float h = 0.0;
+    f.measure(text, px, &w, &h);
+    int width = (int)w + 4;
+    int height = (int)h + 4;
+    *uint8 rgba = alloc<uint8>(width * height * 4);
+    defer free(rgba);
+    float ascent = (float)f.ascent * f.scale(px);
+    f.draw(text, px, rgba, width, height, 2.0, 2.0 + ascent, 0x000000FF);
+    if (argc > 3) {
+        *void out = fopen(argv[3], "wb");
+        if (out == null) {
+            printf("cannot write %s\n", argv[3]);
+            return 1;
+        }
+        fprintf(out, "P5\n%d %d\n255\n", width, height);
+        for (i in 0..width * height) fputc(255 - (int)rgba[i * 4 + 3], out);
+        fclose(out);
+        printf("wrote %s (%d x %d)\n", argv[3], width, height);
+        return 0;
+    }
+    string shades = " .:-=+*#%@";
+    for (y in 0..height) {
+        for (x in 0..width) putchar(shades[(int)rgba[(y * width + x) * 4 + 3] * 9 / 255]);
+        putchar('\n');
+    }
+    return 0;
+}
