@@ -64,6 +64,13 @@ to a PGM image:
 eskiuc run examples/render.esk -- "Hola, Eskiu" 64 hola.pgm
 ```
 
+## Platforms
+
+The package is plain Eskiu with no native library, so it builds for every target Eskiu has:
+macOS, Linux and Windows, iOS and Android, WebAssembly, and freestanding builds. Its tests
+pass on macOS, Linux and Windows in CI, under node as WebAssembly (emscripten) and on an
+Android arm64 emulator.
+
 ## Install
 
 In an Eskiu package (Eskiu 0.12 or newer):
