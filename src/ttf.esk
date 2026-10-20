@@ -1,0 +1,506 @@
+// ttf.esk: TrueType fonts: character mapping, metrics, kerning and glyph
+// outlines.
+//
+//     Font f = font_load("DejaVuSans.ttf")?;
+//     defer f.free();
+//     int g = f.glyph('A');
+//     float scale = f.scale(32.0);           // font units to pixels at 32 px
+//     float advance = (float)f.advance(g) * scale;
+//
+// The font is read from the 'cmap' (formats 4 and 12), 'head', 'hhea',
+// 'hmtx', 'maxp', 'loca', 'glyf' and 'kern' tables. Glyphs are quadratic
+// outlines (TrueType); composite glyphs are flattened into their parts.
+// OpenType fonts with CFF outlines are not supported.
+
+import <mem>;
+import <string>;
+import <list>;
+import <result>;
+import <fs>;
+
+struct Font {
+    *uint8 data;
+    uint64 len;
+    uint32 cmap;
+    int cmap_format;
+    uint32 loca;
+    uint32 glyf;
+    uint32 glyf_len;
+    uint32 hmtx;
+    uint32 kern;
+    int num_glyphs;
+    int num_hmetrics;
+    int units_per_em;
+    bool loca_long;
+    int ascent;
+    int descent;
+    int line_gap;
+}
+
+// One quadratic segment of an outline, in font units (y up); a straight
+// line has its control point at its middle.
+struct FontCurve {
+    float x0;
+    float y0;
+    float cx;
+    float cy;
+    float x1;
+    float y1;
+}
+
+struct FontBox {
+    int x0;
+    int y0;
+    int x1;
+    int y1;
+}
+
+String _font_err;
+
+string _font_fail(string what) {
+    String_clear(&_font_err);
+    String_append(&_font_err, "font: ");
+    String_append(&_font_err, what);
+    return _font_err.data;
+}
+
+uint32 _f_u16(*Font f, uint64 at) {
+    if (at + 2 > f.len) return 0;
+    return (uint32)f.data[at] << 8 | (uint32)f.data[at + 1];
+}
+
+int _f_s16(*Font f, uint64 at) {
+    return (int)(int16)_f_u16(f, at);
+}
+
+uint32 _f_u32(*Font f, uint64 at) {
+    if (at + 4 > f.len) return 0;
+    return (uint32)f.data[at] << 24 | (uint32)f.data[at + 1] << 16 | (uint32)f.data[at + 2] << 8 | (uint32)f.data[at + 3];
+}
+
+// The offset of table tag, 0 when absent; *size gets its length.
+uint32 _f_table(*Font f, string tag, *uint32 size) {
+    uint32 n = _f_u16(f, 4);
+    for (i in 0..n) {
+        uint64 rec = 12 + (uint64)i * 16;
+        if (rec + 16 > f.len) return 0;
+        if (f.data[rec] == (uint8)tag[0] && f.data[rec + 1] == (uint8)tag[1] && f.data[rec + 2] == (uint8)tag[2]
+            && f.data[rec + 3] == (uint8)tag[3]) {
+            uint32 off = _f_u32(f, rec + 8);
+            uint32 len = _f_u32(f, rec + 12);
+            if ((uint64)off > f.len || (uint64)len > f.len - (uint64)off) return 0;
+            if (size != null) *size = len;
+            return off;
+        }
+    }
+    return 0;
+}
+
+Result<Font, string> font_load(string path) {
+    int64 n = 0;
+    *uint8 d = fs_read_all(path, &n);
+    if (d == null) return Err<Font, string>(_font_fail("cannot read the file"));
+    Result<Font, string> r = font_parse(d, (uint64)n);
+    if (!r.ok) free(d);
+    return r;
+}
+
+// Parses a font held in memory. On success the Font owns data (Font_free
+// frees it); on an error data stays the caller's.
+Result<Font, string> font_parse(*uint8 data, uint64 len) {
+    Font f;
+    f.data = data;
+    f.len = len;
+    if (len < 12) return Err<Font, string>(_font_fail("the file is too short"));
+    uint32 tag = _f_u32(&f, 0);
+    if (tag == 0x4F54544F) return Err<Font, string>(_font_fail("CFF (PostScript) outlines are not supported"));
+    if (tag != 0x00010000 && tag != 0x74727565) return Err<Font, string>(_font_fail("not a TrueType font"));
+    uint32 head = _f_table(&f, "head", null);
+    uint32 hhea = _f_table(&f, "hhea", null);
+    uint32 maxp = _f_table(&f, "maxp", null);
+    uint32 cmap = _f_table(&f, "cmap", null);
+    f.loca = _f_table(&f, "loca", null);
+    f.glyf = _f_table(&f, "glyf", &f.glyf_len);
+    f.hmtx = _f_table(&f, "hmtx", null);
+    f.kern = _f_table(&f, "kern", null);
+    if (head == 0 || hhea == 0 || maxp == 0 || cmap == 0 || f.loca == 0 || f.glyf == 0 || f.hmtx == 0) {
+        return Err<Font, string>(_font_fail("a required table is missing"));
+    }
+    f.units_per_em = (int)_f_u16(&f, head + 18);
+    f.loca_long = _f_s16(&f, head + 50) != 0;
+    f.num_glyphs = (int)_f_u16(&f, maxp + 4);
+    f.ascent = _f_s16(&f, hhea + 4);
+    f.descent = _f_s16(&f, hhea + 6);
+    f.line_gap = _f_s16(&f, hhea + 8);
+    f.num_hmetrics = (int)_f_u16(&f, hhea + 34);
+    if (f.units_per_em <= 0 || f.num_glyphs <= 0 || f.num_hmetrics <= 0) return Err<Font, string>(_font_fail("bad header values"));
+    uint32 nsub = _f_u16(&f, cmap + 2);
+    uint32 best = 0;
+    int best_fmt = 0;
+    for (i in 0..nsub) {
+        uint64 rec = (uint64)cmap + 4 + (uint64)i * 8;
+        uint32 platform = _f_u16(&f, rec);
+        uint32 enc = _f_u16(&f, rec + 2);
+        uint32 off = cmap + _f_u32(&f, rec + 4);
+        if ((uint64)off + 4 > len) continue;
+        int fmt = (int)_f_u16(&f, off);
+        bool unicode = platform == 0 || (platform == 3 && (enc == 1 || enc == 10));
+        if (!unicode) continue;
+        if (fmt == 12 && best_fmt != 12) {
+            best = off;
+            best_fmt = 12;
+        } else if (fmt == 4 && best_fmt == 0) {
+            best = off;
+            best_fmt = 4;
+        }
+    }
+    if (best == 0) return Err<Font, string>(_font_fail("no Unicode character map (format 4 or 12)"));
+    f.cmap = best;
+    f.cmap_format = best_fmt;
+    return Ok<Font, string>(f);
+}
+
+void Font_free(*Font self) {
+    if (self.data != null) free(self.data);
+    self.data = null;
+}
+
+// Pixels per font unit for a font size of px pixels (the em square).
+float Font_scale(*Font self, float px) {
+    return px / (float)self.units_per_em;
+}
+
+// The glyph index of a Unicode code point; 0 (the missing glyph) when the
+// font has none.
+int Font_glyph(*Font self, uint32 cp) {
+    uint64 t = (uint64)self.cmap;
+    if (self.cmap_format == 12) {
+        uint32 groups = _f_u32(self, t + 12);
+        uint32 lo = 0;
+        uint32 hi = groups;
+        while (lo < hi) {
+            uint32 mid = (lo + hi) / 2;
+            uint64 g = t + 16 + (uint64)mid * 12;
+            uint32 start = _f_u32(self, g);
+            uint32 end = _f_u32(self, g + 4);
+            if (cp < start) hi = mid;
+            else if (cp > end) lo = mid + 1;
+            else {
+                uint32 gid = _f_u32(self, g + 8) + (cp - start);
+                return gid < (uint32)self.num_glyphs ? (int)gid : 0;
+            }
+        }
+        return 0;
+    }
+    if (cp > 0xFFFF) return 0;
+    uint32 segs = _f_u16(self, t + 6) / 2;
+    uint64 ends = t + 14;
+    uint64 starts = ends + (uint64)segs * 2 + 2;
+    uint64 deltas = starts + (uint64)segs * 2;
+    uint64 ranges = deltas + (uint64)segs * 2;
+    for (i in 0..segs) {
+        uint32 end = _f_u16(self, ends + (uint64)i * 2);
+        if (cp > end) continue;
+        uint32 start = _f_u16(self, starts + (uint64)i * 2);
+        if (cp < start) return 0;
+        uint32 delta = _f_u16(self, deltas + (uint64)i * 2);
+        uint32 range = _f_u16(self, ranges + (uint64)i * 2);
+        if (range == 0) return (int)((cp + delta) & 0xFFFF);
+        uint64 at = ranges + (uint64)i * 2 + (uint64)range + (uint64)(cp - start) * 2;
+        uint32 gid = _f_u16(self, at);
+        if (gid == 0) return 0;
+        gid = (gid + delta) & 0xFFFF;
+        return gid < (uint32)self.num_glyphs ? (int)gid : 0;
+    }
+    return 0;
+}
+
+// The advance width of glyph g, in font units.
+int Font_advance(*Font self, int g) {
+    int i = g < self.num_hmetrics ? g : self.num_hmetrics - 1;
+    return (int)_f_u16(self, (uint64)self.hmtx + (uint64)i * 4);
+}
+
+int Font_left_bearing(*Font self, int g) {
+    if (g < self.num_hmetrics) return _f_s16(self, (uint64)self.hmtx + (uint64)g * 4 + 2);
+    return _f_s16(self, (uint64)self.hmtx + (uint64)self.num_hmetrics * 4 + (uint64)(g - self.num_hmetrics) * 2);
+}
+
+// The kerning between glyphs a and b, in font units (from the 'kern' table,
+// format 0); 0 when the font has none.
+int Font_kerning(*Font self, int a, int b) {
+    if (self.kern == 0) return 0;
+    uint64 t = (uint64)self.kern;
+    uint32 ntables = _f_u16(self, t + 2);
+    uint64 at = t + 4;
+    int total = 0;
+    for (k in 0..ntables) {
+        uint32 length = _f_u16(self, at + 2);
+        uint32 coverage = _f_u16(self, at + 4);
+        if ((coverage >> 8) == 0 && (coverage & 1) != 0 && (coverage & 4) == 0) {
+            uint32 npairs = _f_u16(self, at + 6);
+            uint32 key = (uint32)a << 16 | (uint32)b;
+            uint32 lo = 0;
+            uint32 hi = npairs;
+            while (lo < hi) {
+                uint32 mid = (lo + hi) / 2;
+                uint64 p = at + 14 + (uint64)mid * 6;
+                uint32 pk = _f_u32(self, p);
+                if (key < pk) hi = mid;
+                else if (key > pk) lo = mid + 1;
+                else {
+                    total += _f_s16(self, p + 4);
+                    break;
+                }
+            }
+        }
+        if (length == 0) break;
+        at = at + (uint64)length;
+    }
+    return total;
+}
+
+// The glyph's data range in 'glyf' (0 length for an empty glyph).
+bool _f_glyph_range(*Font self, int g, *uint64 start, *uint64 len) {
+    if (g < 0 || g >= self.num_glyphs) return false;
+    uint64 a = 0;
+    uint64 b = 0;
+    if (self.loca_long) {
+        a = (uint64)_f_u32(self, (uint64)self.loca + (uint64)g * 4);
+        b = (uint64)_f_u32(self, (uint64)self.loca + (uint64)g * 4 + 4);
+    } else {
+        a = (uint64)_f_u16(self, (uint64)self.loca + (uint64)g * 2) * 2;
+        b = (uint64)_f_u16(self, (uint64)self.loca + (uint64)g * 2 + 2) * 2;
+    }
+    if (b < a || b > (uint64)self.glyf_len) return false;
+    *start = (uint64)self.glyf + a;
+    *len = b - a;
+    return true;
+}
+
+// The glyph's bounding box in font units (all zero for an empty glyph).
+FontBox Font_box(*Font self, int g) {
+    uint64 at = 0;
+    uint64 n = 0;
+    if (!_f_glyph_range(self, g, &at, &n) || n < 10) return FontBox{0, 0, 0, 0};
+    return FontBox{_f_s16(self, at + 2), _f_s16(self, at + 4), _f_s16(self, at + 6), _f_s16(self, at + 8)};
+}
+
+struct _FontXf {
+    float a;
+    float b;
+    float c;
+    float d;
+    float e;
+    float f;
+}
+
+void _f_add(List<FontCurve>* out, _FontXf* t, float x0, float y0, float cx, float cy, float x1, float y1) {
+    FontCurve k;
+    k.x0 = t.a * x0 + t.c * y0 + t.e;
+    k.y0 = t.b * x0 + t.d * y0 + t.f;
+    k.cx = t.a * cx + t.c * cy + t.e;
+    k.cy = t.b * cx + t.d * cy + t.f;
+    k.x1 = t.a * x1 + t.c * y1 + t.e;
+    k.y1 = t.b * x1 + t.d * y1 + t.f;
+    List_push(out, k);
+}
+
+// Appends the curves of a simple glyph; false when its data is malformed.
+bool _f_simple(*Font self, uint64 at, uint64 len, int ncontours, _FontXf* t, List<FontCurve>* out) {
+    uint64 end = at + len;
+    uint64 p = at + 10;
+    if (p + (uint64)ncontours * 2 + 2 > end) return false;
+    int npoints = (int)_f_u16(self, p + (uint64)(ncontours - 1) * 2) + 1;
+    uint64 ilen = (uint64)_f_u16(self, p + (uint64)ncontours * 2);
+    uint64 fp = p + (uint64)ncontours * 2 + 2 + ilen;
+    if (fp > end || npoints > 65535) return false;
+    *uint8 flags = alloc<uint8>(npoints + 1);
+    *float xs = alloc<float>(npoints + 1);
+    *float ys = alloc<float>(npoints + 1);
+    defer free(flags);
+    defer free(xs);
+    defer free(ys);
+    int i = 0;
+    while (i < npoints) {
+        if (fp >= end) return false;
+        uint8 fl = self.data[fp];
+        fp++;
+        flags[i] = fl;
+        i++;
+        if ((fl & 8) != 0) {
+            if (fp >= end) return false;
+            int rep = (int)self.data[fp];
+            fp++;
+            for (k in 0..rep) {
+                if (i >= npoints) break;
+                flags[i] = fl;
+                i++;
+            }
+        }
+    }
+    int v = 0;
+    for (k in 0..npoints) {
+        uint8 fl = flags[k];
+        if ((fl & 2) != 0) {
+            if (fp >= end) return false;
+            int dx = (int)self.data[fp];
+            fp++;
+            v += (fl & 16) != 0 ? dx : -dx;
+        } else if ((fl & 16) == 0) {
+            if (fp + 2 > end) return false;
+            v += _f_s16(self, fp);
+            fp += 2;
+        }
+        xs[k] = (float)v;
+    }
+    v = 0;
+    for (k in 0..npoints) {
+        uint8 fl = flags[k];
+        if ((fl & 4) != 0) {
+            if (fp >= end) return false;
+            int dy = (int)self.data[fp];
+            fp++;
+            v += (fl & 32) != 0 ? dy : -dy;
+        } else if ((fl & 32) == 0) {
+            if (fp + 2 > end) return false;
+            v += _f_s16(self, fp);
+            fp += 2;
+        }
+        ys[k] = (float)v;
+    }
+    int first = 0;
+    for (c in 0..ncontours) {
+        int last = (int)_f_u16(self, p + (uint64)c * 2);
+        if (last < first || last >= npoints) return false;
+        int n = last - first + 1;
+        if (n >= 2) {
+            // Start at an on-curve point, or at the midpoint of the first two
+            // off-curve points.
+            int s = -1;
+            for (k in 0..n) {
+                if ((flags[first + k] & 1) != 0) {
+                    s = k;
+                    break;
+                }
+            }
+            float sx = 0.0;
+            float sy = 0.0;
+            if (s >= 0) {
+                sx = xs[first + s];
+                sy = ys[first + s];
+            } else {
+                s = 0;
+                sx = (xs[first] + xs[first + 1 % n]) * 0.5;
+                sy = (ys[first] + ys[first + 1 % n]) * 0.5;
+                s = 0;
+            }
+            float px = sx;
+            float py = sy;
+            bool have_ctrl = false;
+            float qx = 0.0;
+            float qy = 0.0;
+            bool all_off = (flags[first + s] & 1) == 0;
+            for (k in 1..n + 1) {
+                int idx = first + (s + k) % n;
+                float x = xs[idx];
+                float y = ys[idx];
+                bool on = (flags[idx] & 1) != 0;
+                if (all_off && k == n) on = false;
+                if (on) {
+                    if (have_ctrl) _f_add(out, t, px, py, qx, qy, x, y);
+                    else _f_add(out, t, px, py, (px + x) * 0.5, (py + y) * 0.5, x, y);
+                    px = x;
+                    py = y;
+                    have_ctrl = false;
+                } else {
+                    if (have_ctrl) {
+                        float mx = (qx + x) * 0.5;
+                        float my = (qy + y) * 0.5;
+                        _f_add(out, t, px, py, qx, qy, mx, my);
+                        px = mx;
+                        py = my;
+                    }
+                    qx = x;
+                    qy = y;
+                    have_ctrl = true;
+                }
+            }
+            if (have_ctrl) _f_add(out, t, px, py, qx, qy, sx, sy);
+            else if (px != sx || py != sy) _f_add(out, t, px, py, (px + sx) * 0.5, (py + sy) * 0.5, sx, sy);
+        }
+        first = last + 1;
+    }
+    return true;
+}
+
+float _f_f2dot14(*Font self, uint64 at) {
+    return (float)_f_s16(self, at) / 16384.0;
+}
+
+bool _f_outline(*Font self, int g, _FontXf* t, List<FontCurve>* out, int depth) {
+    if (depth > 8) return false;
+    uint64 at = 0;
+    uint64 len = 0;
+    if (!_f_glyph_range(self, g, &at, &len)) return false;
+    if (len == 0) return true;
+    if (len < 10) return false;
+    int ncontours = _f_s16(self, at);
+    if (ncontours >= 0) return ncontours == 0 || _f_simple(self, at, len, ncontours, t, out);
+    uint64 p = at + 10;
+    uint64 end = at + len;
+    while (true) {
+        if (p + 4 > end) return false;
+        uint32 flags = _f_u16(self, p);
+        int child = (int)_f_u16(self, p + 2);
+        p += 4;
+        float dx = 0.0;
+        float dy = 0.0;
+        if ((flags & 1) != 0) {
+            if (p + 4 > end) return false;
+            dx = (float)_f_s16(self, p);
+            dy = (float)_f_s16(self, p + 2);
+            p += 4;
+        } else {
+            if (p + 2 > end) return false;
+            dx = (float)(int8)self.data[p];
+            dy = (float)(int8)self.data[p + 1];
+            p += 2;
+        }
+        if ((flags & 2) == 0) {
+            dx = 0.0;
+            dy = 0.0;
+        }
+        _FontXf m = _FontXf{1.0, 0.0, 0.0, 1.0, dx, dy};
+        if ((flags & 8) != 0) {
+            if (p + 2 > end) return false;
+            m.a = _f_f2dot14(self, p);
+            m.d = m.a;
+            p += 2;
+        } else if ((flags & 0x40) != 0) {
+            if (p + 4 > end) return false;
+            m.a = _f_f2dot14(self, p);
+            m.d = _f_f2dot14(self, p + 2);
+            p += 4;
+        } else if ((flags & 0x80) != 0) {
+            if (p + 8 > end) return false;
+            m.a = _f_f2dot14(self, p);
+            m.b = _f_f2dot14(self, p + 2);
+            m.c = _f_f2dot14(self, p + 4);
+            m.d = _f_f2dot14(self, p + 6);
+            p += 8;
+        }
+        _FontXf c = _FontXf{t.a * m.a + t.c * m.b, t.b * m.a + t.d * m.b, t.a * m.c + t.c * m.d, t.b * m.c + t.d * m.d,
+            t.a * m.e + t.c * m.f + t.e, t.b * m.e + t.d * m.f + t.f};
+        if (!_f_outline(self, child, &c, out, depth + 1)) return false;
+        if ((flags & 0x20) == 0) break;
+    }
+    return true;
+}
+
+// Appends glyph g's outline (font units, y up) to out; false when the glyph
+// data is malformed (out then holds what was read before the error).
+bool Font_outline(*Font self, int g, List<FontCurve>* out) {
+    _FontXf id = _FontXf{1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
+    return _f_outline(self, g, &id, out, 0);
+}
