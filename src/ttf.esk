@@ -18,6 +18,9 @@ import <list>;
 import <result>;
 import <fs>;
 
+// A TrueType font held in memory, with the offsets of the tables it reads and its metrics
+// in font units: units_per_em, ascent, descent (negative, below the baseline) and
+// line_gap. Make one with font_load or font_parse.
 struct Font {
     *uint8 data;
     uint64 len;
@@ -48,6 +51,7 @@ struct FontCurve {
     float y1;
 }
 
+// A glyph's bounding box in font units, y up: (x0, y0) bottom-left, (x1, y1) top-right.
 struct FontBox {
     int x0;
     int y0;
@@ -96,6 +100,7 @@ uint32 _f_table(*Font f, string tag, *uint32 size) {
     return 0;
 }
 
+// Reads the TrueType (.ttf) file at path.
 Result<Font, string> font_load(string path) {
     int64 n = 0;
     *uint8 d = fs_read_all(path, &n);
@@ -160,6 +165,7 @@ Result<Font, string> font_parse(*uint8 data, uint64 len) {
     return Ok<Font, string>(f);
 }
 
+// Frees the font's data.
 void Font_free(*Font self) {
     if (self.data != null) free(self.data);
     self.data = null;
@@ -221,6 +227,7 @@ int Font_advance(*Font self, int g) {
     return (int)_f_u16(self, (uint64)self.hmtx + (uint64)i * 4);
 }
 
+// Glyph g's left side bearing, in font units: from the pen to the left of its outline.
 int Font_left_bearing(*Font self, int g) {
     if (g < self.num_hmetrics) return _f_s16(self, (uint64)self.hmtx + (uint64)g * 4 + 2);
     return _f_s16(self, (uint64)self.hmtx + (uint64)self.num_hmetrics * 4 + (uint64)(g - self.num_hmetrics) * 2);

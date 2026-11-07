@@ -17,6 +17,8 @@ import <libc>;
 import <font/ttf>;
 import <font/raster>;
 
+// One glyph placed by Font_layout: its character, glyph index and pen position (x, y) in
+// pixels.
 struct FontPlaced {
     uint32 cp;
     int glyph;
@@ -24,6 +26,9 @@ struct FontPlaced {
     float y;
 }
 
+// Where a glyph is in a FontAtlas: its character and glyph index, its rectangle in the
+// texture (x, y, width, height), how to place it from the pen (left, top, as in
+// GlyphBitmap) and its advance in pixels.
 struct FontAtlasGlyph {
     uint32 cp;
     int glyph;
@@ -227,6 +232,7 @@ Result<FontAtlas, string> Font_atlas(*Font self, float px, string chars) {
     return Ok<FontAtlas, string>(a);
 }
 
+// The atlas entry of character cp, or null when the atlas does not have it.
 FontAtlasGlyph* FontAtlas_find(*FontAtlas self, uint32 cp) {
     for (i in 0..self.glyphs.size) {
         if (self.glyphs.data[i].cp == cp) return &self.glyphs.data[i];
@@ -234,6 +240,7 @@ FontAtlasGlyph* FontAtlas_find(*FontAtlas self, uint32 cp) {
     return null;
 }
 
+// Frees the texture pixels and the glyph list.
 void FontAtlas_free(*FontAtlas self) {
     if (self.pixels != null) free(self.pixels);
     self.pixels = null;
