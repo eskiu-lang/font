@@ -91,6 +91,8 @@ eskiuc add font --git https://github.com/eskiu-lang/font --rev v0.1.0
 Fonts with PostScript (CFF) outlines, OpenType shaping (`GPOS`/`GSUB`), hinting and
 right-to-left text are not supported.
 
+Every public function and type, with its documentation, is in the [API reference](docs/api.md).
+
 ## Contributing
 
 Bug reports are welcome; please include the program and the `eskiuc --version` output. The
