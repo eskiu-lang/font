@@ -24,7 +24,6 @@ defer b.free();
 // b.pixels: b.width * b.height coverage values (0 to 255), top row
 // first; b.left and b.top place it from the pen position on the
 // baseline (top is negative above the baseline).
-
 ```
 
 The coverage is exact area coverage: every outline segment adds the signed
@@ -94,7 +93,6 @@ f.draw("Hello", 24.0, rgba, width, height, 10, 40, 0xFFFFFFFF);
 
 FontAtlas atlas = f.atlas(32.0, " !\"#...~")?;  // one 8-bit texture
 FontAtlasGlyph* g = atlas.find('A');            // its rectangle and metrics
-
 ```
 
 Text is UTF-8; '\n' starts a new line. Positions are in pixels from the
@@ -231,7 +229,6 @@ defer f.free();
 int g = f.glyph('A');
 float scale = f.scale(32.0);           // font units to pixels at 32 px
 float advance = (float)f.advance(g) * scale;
-
 ```
 
 The font is read from the 'cmap' (formats 4 and 12), 'head', 'hhea',
